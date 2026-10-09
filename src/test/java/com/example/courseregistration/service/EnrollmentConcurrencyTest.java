@@ -21,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * 정원 30명인 강의(CS101)에 서로 다른 학생 100명이 "같은 순간"에 신청한다.
  * 실제 MySQL(docker compose)에 대해 실행되므로 먼저 `docker compose up -d` 가 필요하다.
  *
- * 2단계 현재(동시성 처리 없음)는 이 테스트가 실패하는 것이 정상이다.
+ * 동시성 처리가 없으면 실패하고, 비관적 락을 적용하면 통과한다.
  */
 @SpringBootTest
 class EnrollmentConcurrencyTest {

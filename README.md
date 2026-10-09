@@ -100,3 +100,30 @@ docker compose up -d
    MySQL 이 한쪽을 강제 종료한다. (`SHOW ENGINE INNODB STATUS` 로 확인)
 
 정원을 넘기지 않은 것은 로직이 막아서가 아니라 요청의 77% 가 데드락으로 튕겨 나갔기 때문이다.
+
+## 2단계: 수정 후 결과
+
+비관적 락(`SELECT ... FOR UPDATE`)으로 해결했다.
+
+- `CourseRepository.findByIdForUpdate()` 추가: `@Lock(LockModeType.PESSIMISTIC_WRITE)` 를 붙인 조회 메서드.
+  실행되는 SQL 은 `select ... from courses c1_0 where c1_0.id=? for update of c1_0`.
+- `EnrollmentService.enroll()` / `cancel()`: 강의를 `findById()` 대신 `findByIdForUpdate()` 로 읽는다.
+
+동작 원리: 트랜잭션이 강의 행을 FOR UPDATE 로 읽는 순간 그 행에 배타 잠금(X)이 걸린다.
+같은 강의를 처리하려는 다른 트랜잭션은 FOR UPDATE 지점에서 앞 트랜잭션이 커밋될 때까지 기다린다.
+그래서 같은 강의에 대한 신청/취소는 한 번에 하나씩만 진행되고,
+
+1. 정원 검사(`isFull`)는 항상 방금 커밋된 최신 값을 본다 → 정원 초과 없음
+2. 인원 증가는 앞 트랜잭션의 결과 위에 쌓인다 → 갱신 유실 없음
+3. 자기 트랜잭션이 이미 X 잠금을 쥔 상태에서 INSERT(FK 검사의 S 잠금)와 UPDATE 를 하므로
+   다른 트랜잭션과 잠금을 교차해서 기다릴 일이 없다 → 데드락 없음
+
+같은 테스트를 3번 실행한 결과:
+
+| 실행 | 신청 성공 | 규칙 거절 | 기타 오류 | 강의의 신청 인원 (enrolled_count) | 실제 신청 내역 행 수 |
+|---|---|---|---|---|---|
+| 1회 | 30 | 70 | 0 | 30 | 30 |
+| 2회 | 30 | 70 | 0 | 30 | 30 |
+| 3회 | 30 | 70 | 0 | 30 | 30 |
+
+테스트는 3번 모두 통과(PASSED).

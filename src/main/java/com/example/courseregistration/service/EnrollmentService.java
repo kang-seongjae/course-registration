@@ -14,9 +14,9 @@ import java.util.List;
 /**
  * 수강 신청의 핵심 규칙(비즈니스 로직)을 담당하는 서비스.
  *
- * 1단계에서는 동시성 처리(락 등)를 일부러 넣지 않았다.
- * 여러 요청이 동시에 들어오면 정원 초과나 중복 신청이 발생할 수 있으며,
- * 이는 다음 단계에서 직접 확인하고 고칠 예정이다.
+ * 동시성 처리: 신청/취소 시 강의 행을 비관적 락(SELECT ... FOR UPDATE)으로 읽는다.
+ * 같은 강의에 대한 트랜잭션은 한 번에 하나씩만 진행되므로
+ * 정원 검사와 인원 증감이 항상 최신 값을 기준으로 이루어진다.
  */
 @Service
 public class EnrollmentService {
@@ -50,7 +50,8 @@ public class EnrollmentService {
     @Transactional
     public Enrollment enroll(Long studentId, Long courseId) {
         Student student = findStudent(studentId);
-        Course course = courseRepository.findById(courseId)
+        // 강의 행에 락을 건다. 다른 요청이 같은 강의를 처리 중이면 끝날 때까지 여기서 기다린다.
+        Course course = courseRepository.findByIdForUpdate(courseId)
                 .orElseThrow(() -> new EnrollmentException("존재하지 않는 강의입니다. (강의 ID: " + courseId + ")"));
 
         // 규칙 1: 같은 학생이 같은 강의를 두 번 신청할 수 없다
@@ -79,7 +80,10 @@ public class EnrollmentService {
             throw new EnrollmentException("본인의 신청 내역만 취소할 수 있습니다.");
         }
 
-        enrollment.getCourse().decreaseEnrolledCount();
+        // 취소도 신청과 같은 강의 행을 두고 경쟁하므로 똑같이 락을 걸고 읽는다
+        Course course = courseRepository.findByIdForUpdate(enrollment.getCourse().getId())
+                .orElseThrow(() -> new EnrollmentException("존재하지 않는 강의입니다."));
+        course.decreaseEnrolledCount();
         enrollmentRepository.delete(enrollment);
     }
 
