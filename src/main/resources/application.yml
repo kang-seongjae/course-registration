@@ -1,0 +1,25 @@
+# Spring Boot 애플리케이션 설정 파일
+spring:
+  application:
+    name: course-registration
+
+  datasource:
+    # docker-compose.yml 에서 정의한 MySQL 접속 정보
+    url: jdbc:mysql://localhost:3306/course_registration?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul&characterEncoding=UTF-8
+    username: app
+    password: app1234
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  jpa:
+    hibernate:
+      # update: 엔티티 클래스를 보고 테이블이 없으면 만들고, 있으면 그대로 사용
+      ddl-auto: update
+    # 실행되는 SQL을 콘솔에 보기 좋게 출력 (학습용)
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+    open-in-view: false
+
+server:
+  port: 8080

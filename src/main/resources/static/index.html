@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>수강신청</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; margin: 0; background: #f4f6f9; color: #222; }
+    .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+    h1 { margin: 0 0 16px; font-size: 24px; }
+    h2 { margin: 32px 0 12px; font-size: 18px; }
+    .card { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .student-box { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .student-box input { width: 120px; padding: 8px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px; }
+    .student-box .name { color: #555; }
+    button { padding: 6px 14px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; background: #2d6cdf; color: #fff; }
+    button:hover { background: #1f55b8; }
+    button:disabled { background: #bbb; cursor: not-allowed; }
+    button.cancel { background: #d9534f; }
+    button.cancel:hover { background: #b9403c; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid #e5e5e5; text-align: left; font-size: 14px; }
+    th { background: #fafafa; }
+    tr.full td { color: #999; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+    .badge.ok { background: #e3f2e6; color: #1e7b34; }
+    .badge.full { background: #fde8e8; color: #b42318; }
+    #message { margin-top: 12px; padding: 10px 12px; border-radius: 4px; display: none; font-size: 14px; }
+    #message.success { display: block; background: #e3f2e6; color: #1e7b34; }
+    #message.error { display: block; background: #fde8e8; color: #b42318; }
+    .empty { color: #888; padding: 12px 0; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>수강신청 시스템</h1>
+
+  <div class="card">
+    <div class="student-box">
+      <label for="studentId"><strong>학생 ID</strong></label>
+      <input type="number" id="studentId" min="1" max="100" value="1">
+      <button id="loadBtn">불러오기</button>
+      <span class="name" id="studentInfo">(1 ~ 100 사이의 번호를 입력하세요)</span>
+    </div>
+    <div id="message"></div>
+  </div>
+
+  <h2>강의 목록</h2>
+  <div class="card">
+    <table>
+      <thead>
+      <tr>
+        <th>코드</th><th>강의명</th><th>교수</th><th>정원</th><th>신청 인원</th><th>상태</th><th></th>
+      </tr>
+      </thead>
+      <tbody id="courseList"></tbody>
+    </table>
+  </div>
+
+  <h2>내 신청 목록</h2>
+  <div class="card">
+    <table>
+      <thead>
+      <tr>
+        <th>코드</th><th>강의명</th><th>교수</th><th>신청 시각</th><th></th>
+      </tr>
+      </thead>
+      <tbody id="enrollmentList"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  // ---------- 공통 ----------
+  const $ = (id) => document.getElementById(id);
+
+  function currentStudentId() {
+    const value = Number($("studentId").value);
+    if (!Number.isInteger(value) || value < 1) {
+      showMessage("학생 ID를 올바르게 입력하세요.", true);
+      return null;
+    }
+    return value;
+  }
+
+  function showMessage(text, isError) {
+    const box = $("message");
+    box.textContent = text;
+    box.className = isError ? "error" : "success";
+  }
+
+  // 서버가 오류를 돌려주면 {"message": "..."} 형태이므로 그 메시지를 꺼내 예외로 던진다
+  async function request(url, options) {
+    const res = await fetch(url, options);
+    if (res.status === 204) return null;
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.message || "요청에 실패했습니다. (" + res.status + ")");
+    return body;
+  }
+
+  // ---------- 강의 목록 ----------
+  async function loadCourses() {
+    const courses = await request("/api/courses");
+    const tbody = $("courseList");
+    tbody.innerHTML = "";
+    for (const c of courses) {
+      const tr = document.createElement("tr");
+      if (c.full) tr.className = "full";
+      tr.innerHTML = `
+        <td>${c.code}</td>
+        <td>${c.name}</td>
+        <td>${c.professor}</td>
+        <td>${c.capacity}</td>
+        <td>${c.enrolledCount}</td>
+        <td><span class="badge ${c.full ? "full" : "ok"}">${c.full ? "마감" : "신청 가능"}</span></td>
+        <td><button ${c.full ? "disabled" : ""} data-course-id="${c.id}">신청</button></td>`;
+      tr.querySelector("button").addEventListener("click", () => enroll(c.id));
+      tbody.appendChild(tr);
+    }
+  }
+
+  // ---------- 내 신청 목록 ----------
+  async function loadEnrollments() {
+    const studentId = currentStudentId();
+    if (studentId === null) return;
+
+    const tbody = $("enrollmentList");
+    tbody.innerHTML = "";
+    try {
+      const list = await request(`/api/students/${studentId}/enrollments`);
+      $("studentInfo").textContent = `학생 ${studentId}번으로 조회 중`;
+      if (list.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="5" class="empty">신청한 강의가 없습니다.</td></tr>`;
+        return;
+      }
+      for (const e of list) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${e.courseCode}</td>
+          <td>${e.courseName}</td>
+          <td>${e.professor}</td>
+          <td>${new Date(e.createdAt).toLocaleString("ko-KR")}</td>
+          <td><button class="cancel">취소</button></td>`;
+        tr.querySelector("button").addEventListener("click", () => cancel(e.id));
+        tbody.appendChild(tr);
+      }
+    } catch (err) {
+      $("studentInfo").textContent = "";
+      showMessage(err.message, true);
+    }
+  }
+
+  // ---------- 신청 / 취소 ----------
+  async function enroll(courseId) {
+    const studentId = currentStudentId();
+    if (studentId === null) return;
+    try {
+      const result = await request("/api/enrollments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ studentId, courseId })
+      });
+      showMessage(`신청 완료: ${result.courseName}`, false);
+    } catch (err) {
+      showMessage(err.message, true);
+    }
+    await refresh();
+  }
+
+  async function cancel(enrollmentId) {
+    const studentId = currentStudentId();
+    if (studentId === null) return;
+    try {
+      await request(`/api/enrollments/${enrollmentId}?studentId=${studentId}`, { method: "DELETE" });
+      showMessage("신청을 취소했습니다.", false);
+    } catch (err) {
+      showMessage(err.message, true);
+    }
+    await refresh();
+  }
+
+  async function refresh() {
+    await loadCourses();
+    await loadEnrollments();
+  }
+
+  $("loadBtn").addEventListener("click", refresh);
+  $("studentId").addEventListener("keydown", (e) => { if (e.key === "Enter") refresh(); });
+
+  refresh(); // 페이지를 열면 바로 불러오기
+</script>
+</body>
+</html>

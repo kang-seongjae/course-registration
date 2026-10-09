@@ -1,0 +1,27 @@
+# MySQL 데이터베이스를 Docker 컨테이너로 실행하기 위한 설정 파일
+# 실행: docker compose up -d   /  종료: docker compose down
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: course-registration-mysql
+    ports:
+      - "3306:3306"                     # 내 PC의 3306 포트 -> 컨테이너의 3306 포트
+    environment:
+      MYSQL_ROOT_PASSWORD: root1234
+      MYSQL_DATABASE: course_registration   # 시작 시 자동으로 만들어지는 데이터베이스
+      MYSQL_USER: app                       # 애플리케이션이 접속할 계정
+      MYSQL_PASSWORD: app1234
+      TZ: Asia/Seoul
+    command:
+      - --character-set-server=utf8mb4      # 한글 저장을 위한 문자 집합
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql           # 컨테이너를 지워도 데이터가 남도록 볼륨에 저장
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot1234"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  mysql-data:
