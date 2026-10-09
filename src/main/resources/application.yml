@@ -9,6 +9,10 @@ spring:
     username: app
     password: app1234
     driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # DB 커넥션 풀 크기 (기본 10). 4단계-1에서 10/30/50 을 비교해 50 으로 결정.
+      # MySQL max_connections(기본 151) 보다 작아야 하며, 서버를 여러 대 띄우면 합계를 고려해야 한다.
+      maximum-pool-size: 50
 
   jpa:
     hibernate:
@@ -23,3 +27,7 @@ spring:
 
 server:
   port: 8080
+  tomcat:
+    # TCP 접속 수락 대기열 길이 (기본 100). 4단계-1에서 조정했지만 Windows 는 OS 가 200 으로 제한해 효과가 없었다.
+    # Linux 에서는 somaxconn 범위 안에서 그대로 적용된다.
+    accept-count: 1000
