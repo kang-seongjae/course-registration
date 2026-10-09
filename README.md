@@ -67,3 +67,36 @@ course-registration/
 ```
 
 요청 흐름: `index.html` → `controller` → `service` → `repository` → MySQL
+
+## 2단계: 수정 전 결과
+
+동시성 문제를 확인하기 위한 테스트 `src/test/java/.../EnrollmentConcurrencyTest.java` 를 추가했다.
+정원 30명인 강의(CS101)에 서로 다른 학생 100명이 CountDownLatch 로 같은 순간에 신청한다.
+실제 MySQL(docker compose)에 대해 실행하며, 매 실행 전 CS101 의 신청 내역을 지우고 인원을 0으로 되돌린다.
+
+```powershell
+docker compose up -d
+.\gradlew.bat test --tests "*EnrollmentConcurrencyTest" --rerun
+```
+
+동시성 처리가 없는 상태에서 3번 실행한 결과:
+
+| 실행 | 신청 성공 | 규칙 거절 | 기타 오류(데드락) | 강의의 신청 인원 (enrolled_count) | 실제 신청 내역 행 수 |
+|---|---|---|---|---|---|
+| 1회 | 23 | 0 | 77 | 13 | 23 |
+| 2회 | 22 | 0 | 78 | 12 | 22 |
+| 3회 | 23 | 0 | 77 | 12 | 23 |
+
+테스트는 3번 모두 실패(FAILED). 확인된 문제:
+
+1. **갱신 유실**: 실제 신청 행은 23개인데 `enrolled_count` 는 13. 모든 스레드가 같은 값(0)을 읽고
+   각자 1을 더한 뒤 `enrolled_count = <계산한 값>` 으로 덮어쓰기 때문에 다른 스레드의 증가분이 사라진다.
+   (`EnrollmentService.enroll` 의 `course.increaseEnrolledCount()` 가 메모리 값만 바꾸고 JPA 가 UPDATE 로 덮어쓴다)
+2. **낡은 값으로 정원 검사**: `course.isFull()` 은 자기 트랜잭션이 읽은 시점의 숫자만 본다.
+   100개 스레드가 동시에 0을 읽으면 전부 "정원 안 찼음"으로 판단한다. 이번에는 데드락에 가려졌지만
+   데드락이 없으면 여기서 정원 초과가 발생한다.
+3. **데드락**: `enrollments` 가 `courses` 를 외래 키로 참조하므로 INSERT 시 courses 행에 공유 잠금(S)이 걸리고,
+   이어지는 courses UPDATE 는 같은 행의 배타 잠금(X)을 기다린다. 두 트랜잭션이 서로 S 를 쥔 채 X 를 기다려
+   MySQL 이 한쪽을 강제 종료한다. (`SHOW ENGINE INNODB STATUS` 로 확인)
+
+정원을 넘기지 않은 것은 로직이 막아서가 아니라 요청의 77% 가 데드락으로 튕겨 나갔기 때문이다.
