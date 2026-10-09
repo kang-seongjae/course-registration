@@ -14,13 +14,17 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 애플리케이션이 시작될 때 샘플 데이터(강의 10개, 학생 100명)를 넣는다.
+ * 애플리케이션이 시작될 때 샘플 데이터(강의 10개, 학생 5,000명)를 넣는다.
  * 이미 데이터가 있으면 아무것도 하지 않는다. (재시작해도 중복으로 쌓이지 않도록)
+ * 학생은 현재 인원이 목표보다 적으면 부족한 만큼만 추가한다.
  */
 @Component
 public class DataInitializer implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(DataInitializer.class);
+
+    /** 샘플 학생 수 */
+    private static final int STUDENT_COUNT = 5_000;
 
     private final CourseRepository courseRepository;
     private final StudentRepository studentRepository;
@@ -49,13 +53,14 @@ public class DataInitializer implements ApplicationRunner {
             log.info("샘플 강의 {}개를 등록했습니다.", courses.size());
         }
 
-        if (studentRepository.count() == 0) {
+        long existing = studentRepository.count();
+        if (existing < STUDENT_COUNT) {
             List<Student> students = new ArrayList<>();
-            for (int i = 1; i <= 100; i++) {
-                students.add(new Student(String.format("학생%03d", i)));
+            for (long i = existing + 1; i <= STUDENT_COUNT; i++) {
+                students.add(new Student(String.format("학생%04d", i)));
             }
             studentRepository.saveAll(students);
-            log.info("샘플 학생 {}명을 등록했습니다.", students.size());
+            log.info("샘플 학생 {}명을 추가로 등록했습니다. (총 {}명)", students.size(), STUDENT_COUNT);
         }
     }
 }

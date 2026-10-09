@@ -1,0 +1,8 @@
+# 부하 테스트용 설정. 실행 시 --spring.profiles.active=load 를 붙이면 application.yml 위에 덮어씌워진다.
+# SQL 로그 출력은 그 자체로 느리기 때문에 측정에 방해가 되어 끈다.
+spring:
+  jpa:
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: false
