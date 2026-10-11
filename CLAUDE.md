@@ -10,7 +10,7 @@ Java 21 + Spring Boot 4.1 + Spring Data JPA + MySQL 8.4 (Docker). No auth; the U
 The README is the project log. Each stage appends a results section (before/after tables, bottleneck analysis,
 "next bottleneck" reasoning). Stages so far: 1 basic features → 2 reproduce race, fix with pessimistic lock →
 3 k6 load test baseline → 4-1 Tomcat accept-count / Hikari pool tuning → 4-2 replace the lock with a
-conditional UPDATE plus a unique constraint. **When a stage is completed, append
+conditional UPDATE plus a unique constraint → 4-3 run the app in a Linux container. **When a stage is completed, append
 its measurements and reasoning to README.md in the same style** and commit with a `N단계: ...` message.
 
 Conventions: all code comments, README, test names, and commit messages are in Korean and written for a
@@ -43,6 +43,21 @@ docker exec -i course-registration-mysql mysql -uapp -papp1234 course_registrati
 `reset.sql` wipes all enrollments; `verify.sql` must report `over_capacity = 0` and `mismatch = 0` after every
 run. The k6 script counts HTTP 400 "정원" (capacity-full) responses as expected, not as errors.
 
+Containerized app (stage 4-3). The Dockerfile only copies the jar, so build it first. The `app` service sits
+behind a compose profile so plain `docker compose up -d` still starts only MySQL:
+
+```powershell
+.\gradlew.bat bootJar
+docker compose --profile app up -d --build       # app on :8080 with the load profile, talks to mysql:3306
+docker compose --profile app stop app
+# measure WITHOUT Docker Desktop's port proxy: run k6 inside the compose network
+docker run --rm --network course-registration_default -v "${PWD}\load-test:/t:ro" grafana/k6 run -e VUS=5000 -e BASE_URL=http://app:8080 /t/enroll.js
+```
+
+k6 from Windows against the container goes through `com.docker.backend.exe`, whose Windows-side listen
+backlog is capped at 200 and refuses 80%+ of a 5,000 VU burst. Those numbers measure Docker Desktop, not the
+server. `load-test/backlog_test.py` reproduces the backlog cap on either OS.
+
 ## Architecture
 
 Request flow: `static/index.html` (vanilla JS) → `controller` → `EnrollmentService` → Spring Data repositories → MySQL.
@@ -71,9 +86,10 @@ Everything interesting is in `EnrollmentService.enroll()` / `cancel()`:
 The concurrency test relies on `CS101` having capacity 30 and resets only that course's rows before running.
 
 Tuning knobs live in `application.yml` with comments recording why each value was chosen (Hikari pool 50,
-Tomcat accept-count 1000). Known local limits (stages 4-1 / 4-2): Windows caps the listen backlog at 200, so
-accept-count has no effect and every k6 error is a refused connection; CPU saturates near 90% at 2,000+ VUs
-because server, MySQL, and k6 share one PC; COMMIT on Docker Desktop's virtual disk is spiky (p99 ~70 ms) and
-dominates the remaining row-lock hold time. Useful MySQL evidence sources: `Innodb_row_lock_waits/_time`
-deltas, `performance_schema.events_statements_summary_by_digest` (COMMIT/UPDATE quantiles), and a jstack of
-the `http-nio-8080-exec` threads at ~3 s into a 5,000 VU run.
+Tomcat accept-count 1000). Known local limits (stages 4-1 to 4-3): on Windows the listen backlog is capped at
+200 so accept-count only takes effect inside the Linux container (verified with `ss -ltn`, Send-Q 1000); with
+k6 inside the Docker network errors drop to 0% but p95 stays 3.8 to 5.5 s because CPU saturates near 90%
+(app ~4 cores, MySQL ~1.3, k6 the rest). Useful evidence sources: `Innodb_row_lock_waits/_time` deltas,
+`performance_schema.events_statements_summary_by_event_name` (truncate before a run), `ListenOverflows` in
+the container's `/proc/net/netstat`, `docker stats`, and `docker exec course-registration-app jcmd 1
+Thread.print` at ~3 s into a 5,000 VU run.

@@ -23,5 +23,25 @@ services:
       timeout: 3s
       retries: 10
 
+  # 4단계-3: Spring Boot 앱을 Linux 컨테이너로 실행한다.
+  # profiles 때문에 평소 `docker compose up -d` 는 MySQL 만 띄우고,
+  # `docker compose --profile app up -d --build` 로 실행할 때만 함께 뜬다.
+  # (로컬에서 gradlew bootRun 으로 띄울 때 8080 포트가 겹치지 않도록)
+  app:
+    build: .
+    image: course-registration-app
+    container_name: course-registration-app
+    profiles: ["app"]
+    ports:
+      - "8080:8080"                     # 내 PC의 8080 -> 컨테이너의 8080 (Docker Desktop 이 중계)
+    environment:
+      # 같은 compose 네트워크 안에서는 서비스 이름(mysql)이 곧 호스트 이름이다
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/course_registration?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul&characterEncoding=UTF-8
+      SPRING_PROFILES_ACTIVE: load      # 부하 측정용 (SQL 로그 끔)
+      TZ: Asia/Seoul
+    depends_on:
+      mysql:
+        condition: service_healthy      # MySQL 이 ping 에 응답한 뒤에 앱을 시작
+
 volumes:
   mysql-data:

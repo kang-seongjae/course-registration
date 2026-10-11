@@ -574,3 +574,167 @@ COMMIT 은 로그를 디스크에 쓰는 작업(`innodb_flush_log_at_trx_commit 
 - `Enrollment`: `(student_id, course_id)` 유니크 제약
 - `EnrollmentService`: `enroll()` 은 ② 방식(1차 검사 → 정원 선검사 → 조건부 UPDATE → INSERT, 유니크 위반은 `EnrollmentException` 으로), `cancel()` 은 DELETE → 조건부 UPDATE
 - `EnrollmentConcurrencyTest`: 같은 학생 10번 동시 신청 테스트 추가
+
+## 4단계-3: Linux 컨테이너 실행 결과
+
+4단계-1과 4단계-2에서 오류(connection refused)의 원인은 전부 **Windows 가 접속 수락 대기열을 200 으로 자르는 것**이었다.
+이번에는 서버를 Linux 컨테이너에서 띄워 이 제한을 벗어나는지 확인한다.
+
+### 구성
+
+- `Dockerfile`: `eclipse-temurin:21-jdk-jammy` 이미지에 빌드된 jar 를 복사해서 실행한다. 컨테이너 안에서 Gradle 빌드를 하지 않으므로
+  먼저 `gradlew bootJar` 로 jar 를 만들어야 한다. (`ss` 명령을 쓰기 위해 `iproute2` 를 설치한다)
+- `docker-compose.yml` 에 `app` 서비스를 추가했다. `profiles: ["app"]` 이라서 평소 `docker compose up -d` 는 MySQL 만 띄우고,
+  `--profile app` 을 붙일 때만 앱도 뜬다. 앱은 같은 compose 네트워크에서 `mysql:3306` 으로 직접 접속한다 (Windows 포트 포워딩을 거치지 않는다).
+- Docker Desktop VM: CPU 6개, 메모리 8 GB, 커널 6.18 (WSL2).
+
+```powershell
+.\gradlew.bat bootJar
+docker compose --profile app up -d --build       # MySQL + 앱 (앱은 load 프로필로 실행)
+docker compose --profile app down                 # 둘 다 종료
+```
+
+### 실험 1: 컨테이너 안에서 accept-count 가 실제로 적용되는가
+
+4단계-1에서 한 실험(listen 만 하고 accept 는 하지 않는 소켓에 연결을 계속 넣어 보기)을 `load-test/backlog_test.py` 로 옮겨
+Windows 와 Linux 컨테이너에서 각각 돌렸다. 대기열이 꽉 차면 그 다음 connect 가 실패하므로, 성공한 연결 수가 곧 실제 대기열 크기다.
+
+```powershell
+python load-test\backlog_test.py 5000 6000                                                         # Windows
+docker run --rm -v "${PWD}\load-test:/t:ro" python:3-alpine python /t/backlog_test.py 5000 6000    # Linux 컨테이너
+```
+
+| listen(n) | Windows (성공한 연결 수) | Linux 컨테이너 (성공한 연결 수) |
+|---|---|---|
+| 200 | 200 | 201 |
+| 1,000 | **200** | **1,001** |
+| 5,000 | **200** | **4,097** (`somaxconn` = 4096 에서 잘림) |
+
+Windows 는 무엇을 요청하든 200 이고, Linux 는 요청한 값이 그대로 적용되며 상한은 `net.core.somaxconn`(컨테이너 안 기본값 4096)이다.
+실패한 connect 의 종류도 다르다. Windows 는 즉시 거절(refused)하지만 Linux 는 SYN 을 버려서 클라이언트가 기다리게 된다(timeout). 즉 Linux 에서는 대기열이 넘쳐도 "거절"이 아니라 "지연"으로 나타난다.
+
+실제 Tomcat 소켓도 확인했다. `ss -ltn` 의 Send-Q 열이 LISTEN 소켓에서는 접속 대기열 크기를 뜻한다.
+
+```
+$ docker exec course-registration-app ss -ltn
+State  Recv-Q Send-Q Local Address:Port
+LISTEN 0      1000               *:8080          ← application.yml 의 accept-count: 1000 이 그대로 적용됨
+$ docker exec course-registration-app cat /proc/sys/net/core/somaxconn
+4096
+```
+
+### 실험 2: Docker Desktop 의 포트 포워딩이 새로운 병목인가
+
+k6 를 두 경로로 돌렸다.
+
+- **포워딩 경유**: Windows 의 k6 → `localhost:8080` → Docker Desktop 중계 프로세스 → 컨테이너. 평소 브라우저로 접속하는 경로다.
+- **Docker 네트워크 안**: k6 도 컨테이너(`grafana/k6`)로 띄워 compose 네트워크에서 `http://app:8080` 으로 직접 접속. 중계 프로세스를 거치지 않는다.
+
+```powershell
+# 포워딩 경유
+k6 run -e VUS=5000 load-test/enroll.js
+# Docker 네트워크 안
+docker run --rm --network course-registration_default -v "${PWD}\load-test:/t:ro" grafana/k6 run -e VUS=5000 -e BASE_URL=http://app:8080 /t/enroll.js
+```
+
+두 경로 모두 매 실행 전 `reset.sql`, 실행 후 `verify.sql` 을 돌렸고, 컨테이너 안의 `/proc/net/netstat` 에서
+`ListenOverflows`(접속 대기열이 넘친 횟수)의 실행 전후 차이를 함께 기록했다. Windows 의 8080 포트는 `netstat -ano` 로 확인한 결과
+`com.docker.backend.exe` 가 듣고 있다. 즉 Windows 쪽에서 연결을 받는 것은 Tomcat 이 아니라 Docker Desktop 의 중계 프로세스다.
+
+### 측정 결과: 5,000 VU (4단계-2 vs 4단계-3 두 경로)
+
+| 지표 | 4단계-2 (Windows 네이티브, 3회) | 4단계-3 포워딩 경유 (3회) | 4단계-3 Docker 네트워크 안 (3회) |
+|---|---|---|---|
+| 서버에 도달한 총 요청 | 7,244 ~ 7,834 | 5,293 ~ 5,481 | **10,000 (3회 모두 전부)** |
+| 평균 응답 | 1,784 ~ 2,068 ms | 71 ~ 120 ms | 2,325 ~ 3,269 ms |
+| p95 응답 | 3,419 ~ 5,112 ms | 771 ~ 867 ms | 3,827 ~ 5,479 ms |
+| 초당 처리 | 663 ~ 985 /s | 1,811 ~ 2,146 /s | 1,010 ~ 1,252 /s |
+| **오류 비율** | **27.6 ~ 38.0%** | **82.4 ~ 88.9%** | **0.0%** |
+| 연결 거절 | 2,166 ~ 2,756 | 4,519 ~ 4,707 | 0 |
+| 신청 p95 | 3,494 ~ 4,001 ms | 792 ~ 1,215 ms | 3,718 ~ 5,560 ms |
+| 목록 조회 p95 | 2,237 ~ 5,145 ms | 694 ~ 782 ms | 4,140 ~ 4,545 ms |
+| 행 락 대기 횟수 | 226 ~ 234 | 136 ~ 178 | 124 ~ 152 |
+| 행 락 누적 대기 시간 | 35.4 ~ 64.7 초 | 18.4 ~ 32.6 초 | 17.7 ~ 23.5 초 |
+| PC 전체 CPU 평균 | 88 ~ 94% | 46 ~ 53% | 90 ~ 91% |
+| 컨테이너 ListenOverflows | – | 0 | 0 |
+| DB 정합성 | 정상 | 정상 | 정상 |
+
+포워딩 경유의 평균·p95 가 좋아 보이는 것은 착시다. 요청의 85% 가 서버에 닿지도 못하고 거절됐기 때문에 서버는 거의 놀았다
+(실행 3초 시점 앱 컨테이너 CPU 0.3 ~ 0.5%, HTTP 스레드 200개 전부 유휴, 전체 실행이 약 2.5초 만에 끝남).
+
+Docker 네트워크 안 실행별 상세:
+
+| 실행 | 평균 | p95 | 초당 처리 | 신청 p95 | 목록 p95 | 락 대기 횟수 | 락 누적 | CPU 평균 | 3초 시점 스레드 (커넥션 대기 / DB 작업 중) |
+|---|---|---|---|---|---|---|---|---|---|
+| a | 3,269 ms | 5,479 ms | 1,010 /s | 5,560 ms | 4,545 ms | 146 | 18.2 초 | 91% | 104 / 23 |
+| b | 2,491 ms | 4,903 ms | 1,145 /s | 5,132 ms | 4,214 ms | 152 | 23.3 초 | 90% | 145 / 34 |
+| c | 2,325 ms | 3,827 ms | 1,252 /s | 3,718 ms | 4,140 ms | 124 | 17.7 초 | 91% | 149 / 49 |
+
+실행 3초 시점의 컨테이너별 CPU (`docker stats`, 6코어 = 600%): 앱 363 ~ 409%, MySQL 125 ~ 135%, k6 38 ~ 88%. 앱 컨테이너 메모리 약 800 MB.
+
+### 모든 VU 단계 (p95 / 오류 비율)
+
+| VU | 4단계-2 (Windows 네이티브) | 4단계-3 포워딩 경유 | 4단계-3 Docker 네트워크 안 |
+|---|---|---|---|
+| 500 | 1,710 ms / 0.0% | 767 ms / **40.6%** | 762 ms / 0.0% |
+| 2,000 | 3,299 ms / 17.7% | 1,063 ms / **77.8%** | 2,645 ms / 0.0% |
+| 5,000 | 3,419 ~ 5,112 ms / 27.6 ~ 38.0% | 771 ~ 867 ms / **82.4 ~ 88.9%** | 3,827 ~ 5,479 ms / **0.0%** |
+
+Docker 네트워크 안에서는 500 / 2,000 VU 도 오류 0 이고 p95 가 4단계-2보다 짧다 (500 VU: 1,710 → 762 ms, 2,000 VU: 3,299 → 2,645 ms).
+
+### DB 정합성
+
+포워딩 경유 6회, 네트워크 안 5회 모두 `over_capacity = 0`, `mismatch = 0`. 네트워크 안 실행은 총 신청 행 151(정원 합계)이었고,
+포워딩 경유 실행은 요청이 거의 닿지 않아 119 ~ 151 행이었다 (정원이 안 찬 강의가 남은 것이지 오류가 아니다).
+
+### connection refused 는 줄었는가, 왜인가
+
+**Docker 네트워크 안: 거절 0.** 근거는 세 가지다.
+
+1. 실험 1에서 Linux 는 `accept-count: 1000` 을 그대로 적용한다 (`ss` Send-Q 1000, `listen(1000)` → 1,001 연결).
+2. 그 1,000 조차 넘친 적이 없다. 5,000 VU 3회 모두 컨테이너의 `ListenOverflows` 증가분이 0 이었다. Tomcat 의 acceptor 스레드가 연결을 받아 poller 에 넘기는 속도가
+   5,000개가 몰려드는 속도보다 빠르고, 대기열 1,000 이 그 사이의 완충 역할을 충분히 했다.
+3. 설령 넘쳤더라도 Linux 는 SYN 을 버려서 클라이언트를 기다리게 하지 "거절"하지 않는다 (실험 1의 timeout). 그래서 k6 는 오류 대신 긴 응답 시간을 봤을 것이다.
+
+**포워딩 경유: 거절이 오히려 늘었다 (4단계-2의 28 ~ 38% → 82 ~ 89%, 500 VU 에서도 0% → 41%).** 근거는 다음과 같다.
+
+1. 컨테이너의 `ListenOverflows` 는 0 이다. 거절은 컨테이너에 도달하기 전, 즉 Windows 쪽에서 일어났다.
+2. Windows 의 8080 포트를 듣는 것은 `com.docker.backend.exe` 다. Windows 프로세스이므로 접속 대기열은 똑같이 200 으로 잘린다 (실험 1의 Windows 열).
+3. 4단계-2의 Tomcat(Windows 네이티브)은 대기열 200 을 비우는 일이 "연결을 받아 poller 에 등록"하는 것뿐이었지만, Docker Desktop 중계 프로세스는 연결 하나마다
+   VM 안의 컨테이너로 **새 연결을 하나 더 열어야** 한다. 200 짜리 대기열을 비우는 속도가 Tomcat 보다 느려서 같은 대기열 크기에서도 더 많이 넘친다 (이 부분은 측정이 아니라 동작 원리에서 나온 추정이다).
+
+정리하면 Linux 컨테이너는 접속 대기열 문제를 **완전히 해결**했고, 남은 거절은 전부 "Windows 에서 컨테이너로 들어가는 문"인 Docker Desktop 포트 포워딩에서 생긴다.
+포트 포워딩은 새로운 병목이 맞다. 다만 이것은 이 노트북에서 Windows 쪽 클라이언트가 컨테이너에 접속할 때만 생기는 문제이고, 서버를 실제 Linux 서버에 배포하면 존재하지 않는 경로다.
+
+### 그 밖에 달라진 것
+
+- **DB 왕복 경로가 짧아졌다.** 4단계-2까지 앱(Windows)은 `localhost:3306` → Docker Desktop 중계 → MySQL 컨테이너로 접속했지만, 이제 같은 VM 안에서 직접 접속한다.
+  5,000 VU 에서 COMMIT 평균이 1.3 ~ 2.5 ms → 0.6 ~ 1.0 ms 로, 행 락 누적 대기가 35 ~ 65초 → 18 ~ 24초로 줄었다. (락 대기 횟수 자체도 226 ~ 234 → 124 ~ 152)
+- **서버가 처리한 일은 늘었다.** 4단계-2에서는 7,200 ~ 7,800 요청만 서버에 닿았는데 이제 10,000 요청을 전부 처리하면서 p95 는 비슷한 범위(3.8 ~ 5.5초)다.
+  초당 처리는 663 ~ 985 → 1,010 ~ 1,252 로 늘었다.
+
+### 목표 대비: 오류 1% 미만 → 달성 (Docker 네트워크 안 0%), p95 3초 이내 → 미달 (3.8 ~ 5.5초)
+
+이 노트북 한 대 환경에서 **더 개선할 수 있는 것**:
+
+1. **요청당 CPU 작업 줄이기.** 5,000 VU 동안 앱 컨테이너가 약 4코어(363 ~ 409%)를 쓰고 PC 전체가 90% 다. 응답 시간은 이제 순수하게 "CPU 를 기다리는 시간"이다.
+   요청의 절반인 강의 목록 조회는 매번 DB 를 읽고(5,000 VU 한 번에 SELECT 20,008회 중 5,000회) JSON 으로 바꾸는데, 목록을 짧은 시간(예: 1초) 캐시하면
+   이 요청들이 커넥션 풀 줄에 서지 않게 된다. 3초 시점에 HTTP 스레드 104 ~ 149개가 커넥션을 기다리고 있었고, 그중 상당수가 목록 조회다.
+   신청 쪽은 학생 조회·강의 조회·중복 검사 세 SELECT 를 줄이거나 합칠 여지가 있다.
+2. **부하 발생기를 네트워크 안에서 돌리기.** 측정 방법의 문제이긴 하지만, 이 PC 에서 서버 자체의 한계를 보려면 앞으로는 k6 를 Docker 네트워크 안에서 돌려야 한다.
+   포워딩 경유 숫자는 서버가 아니라 Docker Desktop 의 한계를 재는 것이다.
+3. **COMMIT 디스크 쓰기** (`innodb_flush_log_at_trx_commit = 2`): 4단계-2에서 지목했지만, 지금은 COMMIT 평균이 1 ms 안팎이고 락 누적 대기도 20초 안팎이라 효과가 작을 것이다. 우선순위 낮음.
+
+**이 환경에서는 개선할 수 없는 것**:
+
+1. **CPU 총량.** 6코어를 앱(약 4) + MySQL(약 1.3) + k6(0.4 ~ 0.9)가 나눠 쓴다. 부하 발생기가 같은 PC 에 있는 한 서버가 쓸 수 있는 CPU 는 4코어 남짓이고,
+   초당 1,000 ~ 1,250 요청이 그 상한이다. 설정으로는 안 움직이며, 정확한 서버 한계는 k6 를 다른 머신에서 돌려야 보인다.
+2. **Windows 에서 컨테이너로 들어가는 경로.** Windows 의 접속 대기열 200 제한과 Docker Desktop 포트 포워딩은 OS 와 Docker Desktop 의 동작이라 앱 설정으로 바꿀 수 없다.
+   브라우저 같은 Windows 쪽 클라이언트가 동시에 수천 개 연결을 열면 여전히 거절된다. 실제 Linux 서버에 배포하면 이 경로 자체가 없다.
+3. **Docker Desktop 가상 디스크** 위의 MySQL 은 그대로다. 다만 위에서 본 대로 지금은 병목 순위가 낮다.
+
+### 반영한 파일
+
+- `Dockerfile`, `.dockerignore`: 앱 이미지
+- `docker-compose.yml`: `app` 서비스 (`--profile app`), MySQL healthcheck 뒤에 시작, `mysql:3306` 으로 직접 접속
+- `load-test/backlog_test.py`: 접속 대기열 실험 스크립트
