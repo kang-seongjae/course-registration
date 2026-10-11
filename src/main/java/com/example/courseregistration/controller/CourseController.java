@@ -21,11 +21,9 @@ public class CourseController {
         this.enrollmentService = enrollmentService;
     }
 
-    /** GET /api/courses : 강의 목록 조회 */
+    /** GET /api/courses : 강의 목록 조회 (1초 캐시된 값) */
     @GetMapping
     public List<CourseResponse> getCourses() {
-        return enrollmentService.getCourses().stream()
-                .map(CourseResponse::from)
-                .toList();
+        return enrollmentService.getCourses();
     }
 }

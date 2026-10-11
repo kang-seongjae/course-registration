@@ -39,6 +39,9 @@ class EnrollmentConcurrencyTest {
     @Autowired
     JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    CourseListCache courseListCache;
+
     private Course course;
 
     @BeforeEach
@@ -51,6 +54,10 @@ class EnrollmentConcurrencyTest {
         // 이전 실행의 흔적을 지우고 깨끗한 상태에서 시작한다
         jdbcTemplate.update("delete from enrollments where course_id = ?", course.getId());
         jdbcTemplate.update("update courses set enrolled_count = 0 where id = ?", course.getId());
+        // DB 를 직접 되돌렸으므로 캐시에 남은 "정원 참" 값도 새로 읽게 한다 (4단계-4).
+        // invalidate() 는 표시만 남기고 갱신은 다음 호출이 하므로, 여기서 한 번 호출해 지금 바로 새 값을 읽어 둔다.
+        courseListCache.invalidate();
+        courseListCache.getAll();
     }
 
     @Test

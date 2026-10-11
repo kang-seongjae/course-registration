@@ -10,7 +10,8 @@ Java 21 + Spring Boot 4.1 + Spring Data JPA + MySQL 8.4 (Docker). No auth; the U
 The README is the project log. Each stage appends a results section (before/after tables, bottleneck analysis,
 "next bottleneck" reasoning). Stages so far: 1 basic features → 2 reproduce race, fix with pessimistic lock →
 3 k6 load test baseline → 4-1 Tomcat accept-count / Hikari pool tuning → 4-2 replace the lock with a
-conditional UPDATE plus a unique constraint → 4-3 run the app in a Linux container. **When a stage is completed, append
+conditional UPDATE plus a unique constraint → 4-3 run the app in a Linux container → 4-4 one-second in-memory
+course-list cache and a three-statement enroll path. **When a stage is completed, append
 its measurements and reasoning to README.md in the same style** and commit with a `N단계: ...` message.
 
 Conventions: all code comments, README, test names, and commit messages are in Korean and written for a
@@ -69,10 +70,19 @@ Everything interesting is in `EnrollmentService.enroll()` / `cancel()`:
   that course. The concurrency test and `verify.sql` both assert this invariant.
 - Capacity is enforced by one conditional statement, `CourseRepository.increaseEnrolledCountIfNotFull()`
   (`UPDATE ... SET enrolled_count = enrolled_count + 1 WHERE id = ? AND enrolled_count < capacity`); 0 rows
-  affected means full. The course row is locked only from that UPDATE to commit. Before it, the service does
-  lock-free reads (student, course, duplicate check) and a lock-free `isFull()` pre-check so requests to a
-  full course never touch the row lock. Never load the Course entity and write its counter back: the entity
-  is stale after the UPDATE and a dirty flush would reintroduce the lost-update bug.
+  affected means full. The course row is locked only from that UPDATE to commit. Never load the Course entity
+  and write its counter back: a dirty flush would reintroduce the lost-update bug.
+- `CourseListCache` holds the course list as DTOs for 1 s (stale-while-revalidate: one thread refreshes under
+  a `tryLock`, everyone else keeps the previous snapshot; `invalidate()` only flags the next refresh). Both
+  `GET /api/courses` and the enroll pre-checks (course exists / already full) read it, so a request for a
+  full course does no SQL and opens no transaction. The cache is a fast path only; the UPDATE is the
+  authority. `cancel()` and a 0-row UPDATE call `invalidate()`. Tests that reset the DB by SQL must call
+  `invalidate()` then `getAll()` to refresh synchronously.
+- `enroll()` is not `@Transactional`; it wraps only the DB part in `TransactionTemplate` so rejected requests
+  never take a pool connection. Inside: duplicate-check SELECT → UPDATE → INSERT with `getReferenceById`
+  proxies (no student/course SELECT). A missing student surfaces as an FK violation, which `translate()`
+  distinguishes from the unique-key violation by constraint name in the exception message. The response is
+  built from cached course data, not from the proxy (reading the proxy would trigger a SELECT).
 - **Statement order matters**: the UPDATE on `courses` must precede the INSERT into `enrollments`. The
   INSERT takes a shared FK lock on the course row; doing it first recreates the stage-2 deadlock.
 - Duplicate enrollment is finally enforced by the DB unique constraint `uk_enrollments_student_course`;
@@ -86,10 +96,12 @@ Everything interesting is in `EnrollmentService.enroll()` / `cancel()`:
 The concurrency test relies on `CS101` having capacity 30 and resets only that course's rows before running.
 
 Tuning knobs live in `application.yml` with comments recording why each value was chosen (Hikari pool 50,
-Tomcat accept-count 1000). Known local limits (stages 4-1 to 4-3): on Windows the listen backlog is capped at
-200 so accept-count only takes effect inside the Linux container (verified with `ss -ltn`, Send-Q 1000); with
-k6 inside the Docker network errors drop to 0% but p95 stays 3.8 to 5.5 s because CPU saturates near 90%
-(app ~4 cores, MySQL ~1.3, k6 the rest). Useful evidence sources: `Innodb_row_lock_waits/_time` deltas,
+Tomcat accept-count 1000). Known local limits (stages 4-1 to 4-4): on Windows the listen backlog is capped at
+200 so accept-count only takes effect inside the Linux container (verified with `ss -ltn`, Send-Q 1000). With
+k6 inside the Docker network and the course-list cache, 5,000 VU gives 0% errors and p95 1.6 to 2.6 s (goal
+met). The next bottleneck is the per-course row-lock queue: each successful enroll holds the lock through a
+~20 ms COMMIT fsync, and requests arriving while the cache still says "not full" join that queue. Useful
+evidence sources: `Innodb_row_lock_waits/_time` deltas,
 `performance_schema.events_statements_summary_by_event_name` (truncate before a run), `ListenOverflows` in
 the container's `/proc/net/netstat`, `docker stats`, and `docker exec course-registration-app jcmd 1
 Thread.print` at ~3 s into a 5,000 VU run.

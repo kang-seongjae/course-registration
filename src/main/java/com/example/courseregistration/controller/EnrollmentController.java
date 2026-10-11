@@ -39,8 +39,7 @@ public class EnrollmentController {
     @PostMapping("/api/enrollments")
     @ResponseStatus(HttpStatus.CREATED)
     public EnrollmentResponse enroll(@RequestBody EnrollmentRequest request) {
-        return EnrollmentResponse.from(
-                enrollmentService.enroll(request.studentId(), request.courseId()));
+        return enrollmentService.enroll(request.studentId(), request.courseId());
     }
 
     /** DELETE /api/enrollments/{enrollmentId}?studentId=1 : 수강 신청 취소 */
