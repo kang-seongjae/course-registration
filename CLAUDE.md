@@ -9,7 +9,8 @@ Java 21 + Spring Boot 4.1 + Spring Data JPA + MySQL 8.4 (Docker). No auth; the U
 
 The README is the project log. Each stage appends a results section (before/after tables, bottleneck analysis,
 "next bottleneck" reasoning). Stages so far: 1 basic features → 2 reproduce race, fix with pessimistic lock →
-3 k6 load test baseline → 4-1 Tomcat accept-count / Hikari pool tuning. **When a stage is completed, append
+3 k6 load test baseline → 4-1 Tomcat accept-count / Hikari pool tuning → 4-2 replace the lock with a
+conditional UPDATE plus a unique constraint. **When a stage is completed, append
 its measurements and reasoning to README.md in the same style** and commit with a `N단계: ...` message.
 
 Conventions: all code comments, README, test names, and commit messages are in Korean and written for a
@@ -51,11 +52,18 @@ Everything interesting is in `EnrollmentService.enroll()` / `cancel()`:
 
 - `Course.enrolledCount` is a denormalized counter that must always equal the number of `enrollments` rows for
   that course. The concurrency test and `verify.sql` both assert this invariant.
-- Both methods read the course via `CourseRepository.findByIdForUpdate()` (`@Lock(PESSIMISTIC_WRITE)` →
-  `SELECT ... FOR UPDATE`). This serializes all enroll/cancel transactions per course, which is what prevents
-  over-capacity, lost updates, and the FK-induced deadlock documented in the README stage-2 section.
-  Changing this (e.g. to an atomic `UPDATE ... WHERE enrolled_count < capacity`) is the planned next step.
-- There is deliberately **no DB unique constraint** on `(student_id, course_id)`; duplicate checks are in code only.
+- Capacity is enforced by one conditional statement, `CourseRepository.increaseEnrolledCountIfNotFull()`
+  (`UPDATE ... SET enrolled_count = enrolled_count + 1 WHERE id = ? AND enrolled_count < capacity`); 0 rows
+  affected means full. The course row is locked only from that UPDATE to commit. Before it, the service does
+  lock-free reads (student, course, duplicate check) and a lock-free `isFull()` pre-check so requests to a
+  full course never touch the row lock. Never load the Course entity and write its counter back: the entity
+  is stale after the UPDATE and a dirty flush would reintroduce the lost-update bug.
+- **Statement order matters**: the UPDATE on `courses` must precede the INSERT into `enrollments`. The
+  INSERT takes a shared FK lock on the course row; doing it first recreates the stage-2 deadlock.
+- Duplicate enrollment is finally enforced by the DB unique constraint `uk_enrollments_student_course`;
+  the service translates `DataIntegrityViolationException` into `EnrollmentException` (the transaction
+  rolls back, undoing the counter increment). The `existsBy...` check is only a fast path for messages.
+- `cancel()` deletes via `deleteByIdReturningCount()` and decrements only when a row was actually deleted.
 - Rule violations throw `EnrollmentException` → `GlobalExceptionHandler` → HTTP 400 `{"message": "..."}`.
   Clients (UI, k6 script) match on the Korean message text (e.g. "정원"), so don't reword messages casually.
 
@@ -63,5 +71,9 @@ Everything interesting is in `EnrollmentService.enroll()` / `cancel()`:
 The concurrency test relies on `CS101` having capacity 30 and resets only that course's rows before running.
 
 Tuning knobs live in `application.yml` with comments recording why each value was chosen (Hikari pool 50,
-Tomcat accept-count 1000). Note from stage 4-1: Windows caps the listen backlog at 200, so accept-count has no
-effect locally; the measured throughput ceiling is CPU saturation from running server, MySQL, and k6 on one PC.
+Tomcat accept-count 1000). Known local limits (stages 4-1 / 4-2): Windows caps the listen backlog at 200, so
+accept-count has no effect and every k6 error is a refused connection; CPU saturates near 90% at 2,000+ VUs
+because server, MySQL, and k6 share one PC; COMMIT on Docker Desktop's virtual disk is spiky (p99 ~70 ms) and
+dominates the remaining row-lock hold time. Useful MySQL evidence sources: `Innodb_row_lock_waits/_time`
+deltas, `performance_schema.events_statements_summary_by_digest` (COMMIT/UPDATE quantiles), and a jstack of
+the `http-nio-8080-exec` threads at ~3 s into a 5,000 VU run.

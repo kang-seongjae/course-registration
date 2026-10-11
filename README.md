@@ -275,3 +275,302 @@ Linux 에서는 `net.core.somaxconn`(기본 4096) 안에서 설정값이 그대�
 
 - `spring.datasource.hikari.maximum-pool-size: 50`
 - `server.tomcat.accept-count: 1000` (Windows 에서는 효과 없음, Linux 용)
+
+## 4단계-2: 락 구간 축소 결과
+
+4단계-1에서 "같은 강의 행에 대한 락 경합"이 다음 병목으로 꼽혔다. 신청 트랜잭션 하나가 락을 쥔 채
+여러 문장을 보내므로 락을 쥐는 시간이 길었다. 이번 단계에서는 **락을 쥐는 구간을 줄이는 것**이 목표다.
+
+### 바꾸기 전에: 왜 이 방식이 락 시간을 줄이는가
+
+2단계 방식(`SELECT ... FOR UPDATE`)의 신청 흐름은 이랬다. 번호는 DB 로 보내는 문장 순서다.
+
+```
+1. SELECT 학생                 (락 없음)
+2. SELECT 강의 FOR UPDATE      ← 여기서 강의 행이 잠긴다
+3. SELECT 중복 신청 여부
+4. INSERT 신청 내역
+5. UPDATE 강의 (enrolled_count = 자바가 계산한 값)
+6. COMMIT                      ← 여기서 풀린다
+```
+
+강의 행은 2번부터 6번까지 잠겨 있다. 그 사이 자바는 DB 응답을 받고 → 다음 문장을 만들고 → 다시 보내기를 네 번 반복한다.
+같은 강의를 신청하려는 다른 요청은 전부 2번 지점에서 이 과정이 끝나기를 기다린다.
+은행 창구에 비유하면, 창구 직원이 손님 한 명의 서류를 들고 있는 동안 뒷줄 전체가 멈춰 있는 것과 같다.
+줄이 줄어드는 속도는 "한 명을 처리하는 시간"에 달려 있으므로, 그 시간을 줄이는 것이 핵심이다.
+
+조건부 UPDATE 방식은 2번과 5번(검사와 증가)을 DB 안에서 한 문장으로 처리한다.
+
+```sql
+update courses
+   set enrolled_count = enrolled_count + 1
+ where id = ? and enrolled_count < capacity
+```
+
+- `enrolled_count < capacity` 가 정원 검사다. 조건에 맞는 행이 없으면 아무것도 바꾸지 않는다.
+- `enrolled_count + 1` 은 자바가 계산한 값이 아니라 **DB 가 지금 저장된 값에 더한다.** 다른 요청의 증가분을 덮어쓸 일이 없다.
+- 실행 결과로 "바뀐 행 수"가 돌아온다. 1 이면 신청 성공, 0 이면 정원이 찬 것이다. 즉 검사 결과를 따로 읽어 올 필요가 없다.
+- DB 는 이 UPDATE 를 실행하는 동안 행을 잠그고, 트랜잭션이 끝날 때 푼다. 자바가 "읽고 → 생각하고 → 쓰는" 왕복이 사라진다.
+
+바꾼 뒤의 흐름은 이렇다.
+
+```
+1. SELECT 학생                 (락 없음)
+2. SELECT 강의                 (락 없음, 이름/정원을 메시지에 쓰기 위해)
+3. SELECT 중복 신청 여부        (락 없음)
+4. UPDATE 강의 (조건부)         ← 여기서 잠긴다
+5. INSERT 신청 내역
+6. COMMIT                      ← 여기서 풀린다
+```
+
+잠긴 상태로 보내는 문장이 4개(3, 4, 5, 6)에서 3개(4, 5, 6)로 줄었다.
+
+**주의할 점**
+
+1. **INSERT 는 UPDATE 뒤에, 같은 트랜잭션 안에 있어야 한다.** INSERT 를 먼저 하면 2단계에서 본 데드락이 되살아난다.
+   `enrollments` 가 `courses` 를 외래 키로 참조하므로 INSERT 는 강의 행에 공유 잠금(S)을 건다.
+   두 요청이 S 를 쥔 채 UPDATE 의 배타 잠금(X)을 서로 기다리면 데드락이다. UPDATE(X)를 먼저 잡으면 INSERT 의 S 는 자기 것이라 문제없다.
+   그래서 락 구간이 0 이 되지는 않는다. INSERT 와 COMMIT 은 여전히 락 안에 있다.
+2. **정원이 찬 강의에 대한 UPDATE 도 행을 잠근다.** MySQL 기본 격리 수준(REPEATABLE READ)에서는 UPDATE 가 PK 로 찾은 행을
+   조건(`enrolled_count < capacity`)이 안 맞아도 트랜잭션 끝까지 잠근다. 정원이 찬 뒤에 몰려오는 수천 건의 요청이
+   "거절당하기 위해" 락 줄에 서는 셈이다. 이 문제는 아래 측정에서 실제로 드러났고, 락 없는 선검사로 해결했다.
+3. **메모리의 Course 객체는 낡은 값을 갖는다.** 2번에서 락 없이 읽은 `enrolledCount` 는 UPDATE 이후의 값과 다르다.
+   이 객체는 이름과 정원을 메시지에 쓰는 용도로만 쓰고, 값을 바꿔서 저장하면 안 된다. (바꾸면 JPA 가 UPDATE 로 덮어써서 갱신 유실이 다시 생긴다)
+4. **강의 행 락이 사라지면 중복 신청 검사에 빈틈이 생긴다.** 아래에서 따로 다룬다.
+
+### 같은 학생의 중복 신청은 어떻게 막나
+
+2단계에서는 FOR UPDATE 가 같은 강의에 대한 모든 신청을 한 줄로 세웠기 때문에, "중복 검사(3번) → INSERT(4번)" 사이에
+같은 학생의 다른 요청이 끼어들 수 없었다. 이제 3번은 락 없이 실행되므로 같은 학생의 요청 10개가 동시에 오면
+10개 모두 "아직 신청 안 함"을 보고 INSERT 까지 갈 수 있다.
+
+그래서 `enrollments` 테이블에 `(student_id, course_id)` **유니크 제약**을 걸었다 (`uk_enrollments_student_course`).
+DB 는 같은 조합의 두 번째 INSERT 를 거부하고 `DataIntegrityViolationException` 을 던진다.
+서비스는 이것을 잡아 `EnrollmentException("이미 신청한 강의입니다")` 로 바꾼다. 예외가 던져지면 트랜잭션이 롤백되므로
+바로 앞 UPDATE 로 늘린 인원도 함께 되돌아간다.
+
+코드의 `existsByStudentIdAndCourseId` 검사는 그대로 두었다. 대부분의 중복 신청(화면에서 두 번 누르기 등)은
+여기서 걸려 락을 잡기 전에 거절되고, 동시에 들어온 경우만 유니크 제약까지 간다. 즉 **코드 검사는 1차, 유니크 제약이 최종** 이다.
+
+유니크 제약은 Hibernate `ddl-auto: update` 가 기존 테이블에 자동으로 추가했다 (`SHOW CREATE TABLE enrollments` 로 확인).
+기존 데이터에 중복 조합이 있었다면 추가에 실패했을 것이므로, 먼저 151행 / 151개 조합으로 중복이 없음을 확인했다.
+
+### 수정 전후 코드 비교
+
+**CourseRepository**
+
+```java
+// 수정 전 (2단계): 락을 걸고 읽는다
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select c from Course c where c.id = :id")
+Optional<Course> findByIdForUpdate(@Param("id") Long id);
+
+// 수정 후 (4단계-2): 검사와 증가를 한 문장으로. 반환값은 바뀐 행 수
+@Modifying
+@Query("update Course c set c.enrolledCount = c.enrolledCount + 1 "
+        + "where c.id = :id and c.enrolledCount < c.capacity")
+int increaseEnrolledCountIfNotFull(@Param("id") Long id);
+
+@Modifying
+@Query("update Course c set c.enrolledCount = c.enrolledCount - 1 "
+        + "where c.id = :id and c.enrolledCount > 0")
+int decreaseEnrolledCount(@Param("id") Long id);
+```
+
+**EnrollmentService.enroll()**
+
+```java
+// 수정 전 (2단계)
+Student student = findStudent(studentId);
+Course course = courseRepository.findByIdForUpdate(courseId)        // ← 락 시작
+        .orElseThrow(...);
+if (enrollmentRepository.existsByStudentIdAndCourseId(studentId, courseId)) {
+    throw new EnrollmentException("이미 신청한 강의입니다: " + course.getName());
+}
+if (course.isFull()) {                                             // 자바가 검사
+    throw new EnrollmentException("정원이 가득 찼습니다: ...");
+}
+course.increaseEnrolledCount();                                    // 자바가 더하고 JPA 가 UPDATE
+return enrollmentRepository.save(new Enrollment(student, course)); // 커밋 때 락 해제
+
+// 수정 후 (4단계-2)
+Student student = findStudent(studentId);
+Course course = courseRepository.findById(courseId)                 // 락 없는 일반 조회
+        .orElseThrow(...);
+if (enrollmentRepository.existsByStudentIdAndCourseId(studentId, courseId)) { // 1차 검사
+    throw new EnrollmentException("이미 신청한 강의입니다: " + course.getName());
+}
+if (course.isFull()) {                                             // 락 없는 선검사 (②)
+    throw new EnrollmentException("정원이 가득 찼습니다: ...");
+}
+int updated = courseRepository.increaseEnrolledCountIfNotFull(courseId); // ← 락 시작, 최종 검사 (①)
+if (updated == 0) {
+    throw new EnrollmentException("정원이 가득 찼습니다: ...");
+}
+try {
+    return enrollmentRepository.save(new Enrollment(student, course));   // 커밋 때 락 해제
+} catch (DataIntegrityViolationException e) {                            // 유니크 제약 = 최종 중복 검사
+    throw new EnrollmentException("이미 신청한 강의입니다: " + course.getName());
+}
+```
+
+**EnrollmentService.cancel()** 도 같은 방식으로 바꿨다. 락을 걸고 읽는 대신, 신청 내역을 먼저 지우고(`delete ... where id = ?`,
+지운 행 수가 0 이면 "이미 취소됨") 실제로 지워졌을 때만 `enrolled_count - 1` UPDATE 를 보낸다.
+같은 신청을 동시에 두 번 취소해도 인원이 두 번 줄지 않는다.
+
+**Enrollment** 엔티티에 `@UniqueConstraint(name = "uk_enrollments_student_course", columnNames = {"student_id", "course_id"})` 를 추가했다.
+
+### 확인 1, 2: 동시성 테스트
+
+`EnrollmentConcurrencyTest` 에 두 번째 테스트를 추가했다. 같은 학생(ID 1)이 CS101 에 10개 스레드로 동시에 신청한다.
+
+```powershell
+docker compose up -d
+.\gradlew.bat test --tests "*EnrollmentConcurrencyTest" --rerun
+```
+
+| 실행 | 테스트 1 (학생 100명 → 정원 30) | 테스트 2 (같은 학생 10번) |
+|---|---|---|
+| 1회 | 성공 30, 거절 70, 오류 0, 인원 30, 행 30 — PASSED | 성공 1, 거절 9, 오류 0, 인원 1, 행 1 — PASSED |
+| 2회 | 성공 30, 거절 70, 오류 0, 인원 30, 행 30 — PASSED | 성공 1, 거절 9, 오류 0, 인원 1, 행 1 — PASSED |
+| 3회 | 성공 30, 거절 70, 오류 0, 인원 30, 행 30 — PASSED | 성공 1, 거절 9, 오류 0, 인원 1, 행 1 — PASSED |
+
+테스트 2의 거절 메시지는 모두 "이미 신청한 강의입니다" 였다. 9건 중 일부는 1차 검사에서, 나머지는 유니크 제약에서 걸렸다.
+(선검사를 넣기 전과 후 모두 같은 결과로 3번씩 통과했다.)
+
+### 확인 3: 부하 테스트
+
+4단계-1과 같은 시나리오(500 / 2,000 / 5,000 VU, 매 실행 전 `reset.sql`, 실행 후 `verify.sql`)로 측정했다.
+설정은 4단계-1에서 반영한 그대로(풀 50, accept-count 1000)이며 코드만 바뀌었다.
+5,000 VU 는 편차가 커서 3번 측정했다. 이번에는 추가로 다음을 함께 기록했다.
+
+- MySQL `Innodb_row_lock_waits` / `Innodb_row_lock_time` 의 실행 전후 차이 (행 락 대기 횟수 / 누적 대기 시간)
+- MySQL `performance_schema` 로 문장 종류별 실행 횟수와 평균 시간 (실행 전 초기화)
+- 실행 3초 시점의 jstack 스레드 덤프 (HTTP 스레드 200개가 무엇을 하는지)
+- `typeperf` 로 1초마다 PC 전체 CPU 사용률
+
+코드 변경은 두 단계로 나눠 측정했다.
+
+- **① 조건부 UPDATE 로 합치기만** — 위에서 설명한 본래 변경
+- **② ① + 정원 선검사** — "주의할 점 2"의 문제를 해결하기 위해, 락 없이 읽은 강의의 `isFull()` 이 참이면 UPDATE 를 보내지 않고 바로 거절
+
+#### 5,000 VU 비교 (4단계-1 풀 50 vs ① vs ②)
+
+| 지표 | 4단계-1 풀 50 (1회) | ① UPDATE 합치기 (4회 범위) | ② ① + 정원 선검사 (3회 범위) |
+|---|---|---|---|
+| 평균 응답 | 2,014 ms | 1,188 ~ 2,986 ms | 1,784 ~ 2,068 ms |
+| p95 응답 | 4,407 ms | 3,171 ~ 9,134 ms | 3,419 ~ 5,112 ms |
+| 초당 처리 | 734 /s | 425 ~ 927 /s | 663 ~ 985 /s |
+| 오류 비율 | 39.2% | 38.0 ~ 51.6% | 27.6 ~ 38.0% |
+| 연결 거절 | 2,814 | 2,754 ~ 3,405 | 2,166 ~ 2,756 |
+| 신청 p95 | 4,637 ms | 2,490 ~ 9,350 ms | 3,494 ~ 4,001 ms |
+| 목록 조회 p95 | 3,358 ms | 2,923 ~ 5,440 ms | 2,237 ~ 5,145 ms |
+| **행 락 대기 횟수** | **1,719** | **940 ~ 1,392** | **226 ~ 234** |
+| **행 락 누적 대기 시간** | **126.8 초** | **55.6 ~ 181.4 초** | **35.4 ~ 64.7 초** |
+| 정합성 | 정상 | 정상 (4회 모두) | 정상 (3회 모두) |
+
+② 의 5,000 VU 실행별 상세:
+
+| 실행 | 평균 | p95 | 초당 처리 | 오류 | 연결 거절 | 신청 p95 | 목록 p95 | 락 대기 횟수 | 락 누적 | CPU 평균 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| a | 1,821 ms | 5,112 ms | 663 /s | 38.0% | 2,756 | 3,679 ms | 5,145 ms | 226 | 64.7 초 | 94% |
+| b | 2,068 ms | 4,003 ms | 802 /s | 29.6% | 2,282 | 4,001 ms | 4,008 ms | 229 | 49.3 초 | 93% |
+| c | 1,784 ms | 3,419 ms | 985 /s | 27.6% | 2,166 | 3,494 ms | 2,237 ms | 234 | 35.4 초 | 88% |
+
+① 의 5,000 VU 실행별 상세 (4회):
+
+| 실행 | 평균 | p95 | 초당 처리 | 오류 | 연결 거절 | 신청 p95 | 락 대기 횟수 | 락 누적 |
+|---|---|---|---|---|---|---|---|---|
+| a | 2,986 ms | 9,134 ms | 425 /s | 39.0% | 2,808 | 9,350 ms | 1,194 | 181.4 초 |
+| b | 1,188 ms | 3,662 ms | 791 /s | 51.6% | 3,405 | 2,490 ms | 940 | 68.3 초 |
+| c | 1,772 ms | 4,860 ms | 722 /s | 41.8% | 2,950 | 4,940 ms | 1,155 | 76.4 초 |
+| d | 1,446 ms | 3,171 ms | 927 /s | 38.0% | 2,754 | 2,984 ms | 1,392 | 55.6 초 |
+
+편차에 대해: 연결 거절이 많은 실행일수록 서버에 도달하는 요청이 적어 응답 시간이 좋게 나온다 (① b: 거절 3,405건, p95 3.7초 / ① a: 거절 2,808건, p95 9.1초).
+즉 오류 비율과 p95 는 서로 맞물려 움직이므로 한 번의 p95 로 우열을 가리면 안 된다. 범위로 보면 ② 는 4단계-1과 비슷하거나 약간 나은 수준이고, 확실하게 달라진 것은 락 지표다.
+
+#### 모든 VU 단계 (p95 / 오류 비율)
+
+| VU | 4단계-1 풀 50 | ① UPDATE 합치기 | ② ① + 정원 선검사 |
+|---|---|---|---|
+| 500 | 2,434 ms / 0.0% | 2,388 ms / 0.0% | 1,710 ms / 0.0% |
+| 2,000 | 3,452 ms / 23.3% | 5,090 ms / 19.3% | 3,299 ms / 17.7% |
+| 5,000 | 4,407 ms / 39.2% | 3,171 ~ 9,134 ms / 38.0 ~ 51.6% | 3,419 ~ 5,112 ms / 27.6 ~ 38.0% |
+
+500 / 2,000 VU 의 행 락 지표: ① 500 VU 299회 / 60.1초, 2,000 VU 729회 / 83.3초 → ② 500 VU 220회 / 48.5초, 2,000 VU 253회 / 68.2초.
+(서버를 막 띄운 직후의 첫 500 VU 실행은 JIT 예열 전이라 p95 2.6 ~ 2.9초로 나왔고, 표에는 두 번째 실행을 적었다.)
+
+#### DB 정합성
+
+①, ② 합쳐 12번의 부하 실행 모두 `over_capacity = 0`, `mismatch = 0`, 총 신청 행 151 이었다.
+
+#### 서버 내부 지표 (5,000 VU)
+
+문장 종류별 실행 횟수와 평균 시간 (performance_schema, 실행 1회분):
+
+| 문장 | ① (실행 d) | ② (실행 a) |
+|---|---|---|
+| SELECT | 8,994회, 0.49 ms | 8,981회, 0.25 ms |
+| **UPDATE courses (조건부)** | **2,246회, 26.1 ms (합계 58.6초)** | **239회, 271 ms (합계 64.9초)** |
+| INSERT enrollments | 151회, 1.6 ms | 151회, 0.45 ms |
+| COMMIT | 2,397회, 1.8 ms | 2,395회, 2.5 ms |
+| ROLLBACK | 2,095회 | 2,093회 |
+
+UPDATE 의 합계 시간(58.6초 / 64.9초)은 같은 실행의 행 락 누적 대기 시간(55.6초 / 64.7초)과 거의 같다.
+즉 **UPDATE 에 걸린 시간은 사실상 전부 락을 기다린 시간**이다.
+
+실행 3초 시점의 HTTP 스레드 200개 (jstack):
+
+| 설정 | DB 커넥션 대기 (`HikariPool.getConnection`) | DB 작업 중 (커넥션을 쥐고 MySQL 응답 대기) |
+|---|---|---|
+| 4단계-1 풀 50 | 149 | 49 |
+| ② 실행 a / b / c | 150 / 150 / 150 | 48 / 50 / 50 |
+
+CPU: ② 의 5,000 VU 실행 중 PC 전체 CPU 평균 88 ~ 94%, 최고 100% (6코어). 2,000 VU 에서도 92%.
+
+낮은 부하(50 VU, 참고용)에서는 평균 79 ms, p95 147 ms, 신청 평균 106 ms 였다. 같은 서버가 5,000 VU 에서는 20 ~ 30배 느려진다.
+
+### 왜 ① 만으로는 효과가 없었고 ② 는 효과가 있었나
+
+**① 의 효과가 작았던 이유**
+
+- 락 안의 문장이 4개에서 3개로 줄었을 뿐이다. INSERT 는 외래 키 때문에 UPDATE 뒤 같은 트랜잭션에 있어야 하고(주의할 점 1), COMMIT 도 락 안에 있다.
+- 정원이 찬 강의에 대한 UPDATE 도 행을 잠근다(주의할 점 2). 실행 d 에서 UPDATE 2,246회 중 실제로 신청에 성공한 것은 151회이고,
+  나머지 **2,095회는 "정원이 찼다"는 답을 듣기 위해 락 줄에 섰다가 롤백**했다. 2단계의 FOR UPDATE 도 똑같이 락을 잡고 거절했으므로, 이 부분은 달라진 게 없었다.
+- 그래서 락 대기 횟수가 1,719 → 940 ~ 1,392 로 조금 줄고, 누적 시간은 실행에 따라 더 늘기도 했다.
+
+**② 의 효과**
+
+- 락 없이 읽은 `enrolled_count` 가 이미 정원과 같으면 UPDATE 를 보내지 않는다. 이 값은 조금 낡았을 수 있지만, 정원이 찬 강의는 누가 취소하기 전까지 계속 차 있으므로
+  거절해도 틀리지 않는다. 혹시 그 사이에 자리가 났더라도 다음 요청이 가져가므로 정원이 비는 일은 없고, 반대로 낡은 값이 "안 찼음"이면 UPDATE 가 최종 판단을 한다.
+- UPDATE 횟수가 2,246 → 239 로, 행 락 대기 횟수가 1,719(4단계-1) → 226 ~ 234 로 **87% 줄었다.** 누적 대기 시간도 126.8초 → 35 ~ 65초로 줄었다.
+- 신청 p95 가 4,637 ms → 3,494 ~ 4,001 ms 로 나아졌고, 오류 비율도 범위 기준으로 조금 내려갔다.
+
+**그래도 락 대기가 남는 이유** — ② 에서 UPDATE 1회당 평균 대기가 140 ~ 270 ms 다. 출발 직후 10개 강의마다 20여 건이 동시에 UPDATE 에 도착해 한 줄로 서기 때문에,
+줄의 길이(약 24 ÷ 2 = 12 명분) × 한 건의 락 보유 시간으로 나뉘어 **한 트랜잭션이 락을 쥐는 시간은 약 20 ms** 로 추정된다. 50 VU 에서도 같은 계산(5명 줄, 평균 대기 49 ms)으로 약 20 ms 가 나온다.
+이 20 ms 안에서 측정된 것은 COMMIT 이다. 세션 전체 누적으로 COMMIT 은 평균 3.7 ms 지만 **p95 28.8 ms, p99 69 ms, 최대 349 ms** 였다 (INSERT 는 p95 3.6 ms).
+COMMIT 은 로그를 디스크에 쓰는 작업(`innodb_flush_log_at_trx_commit = 1`)이고, MySQL 이 Docker Desktop 의 가상 디스크 위에서 돌기 때문에 느리고 들쭉날쭉하다.
+느린 COMMIT 하나가 그 강의 줄 전체를 멈춰 세운다 (행 락 최장 대기 1,773 ms).
+
+### 목표(5,000 VU 오류 1% 미만, p95 3초 이내) → 달성하지 못함. 남은 병목과 근거
+
+1. **Windows 접속 대기열 200 제한 (오류의 전부)** — 오류는 ①, ② 합쳐 12번 모두 `dial: connection refused` 뿐이다.
+   애플리케이션 오류(5xx) 0건, 서버 로그 예외 0건, k6 의 `enroll_other` 0건. 4단계-1에서 확인한 대로 OS 가 수락 대기열을 200 으로 자르기 때문이며,
+   코드나 설정으로는 넘을 수 없다. 오류 1% 미만은 Linux(Docker 컨테이너 등)에서 서버를 띄우거나, 앞에 리버스 프록시를 두거나, 접속을 몇 초에 걸쳐 분산해야 가능하다.
+2. **PC 의 CPU 포화 (응답 시간의 상한)** — 5,000 VU 동안 CPU 88 ~ 94%, 2,000 VU 에서도 92%. 서버·MySQL·k6 가 한 PC 를 나눠 쓴다.
+   락 대기를 87% 줄였는데도 p95 가 3.4 ~ 5.1초인 이유다. 락과 무관한 목록 조회(단순 SELECT, 서버 쪽 0.25 ms)조차 p95 2.2 ~ 5.1초가 걸린다.
+   HTTP 스레드 200개 중 150개가 커넥션을 기다리는 것도 결국 "커넥션을 쥔 50개가 CPU 를 못 받아 느리게 끝나기" 때문이다. 풀을 더 키워도 CPU 가 없으면 소용없다(4단계-1의 풀 30 결과와 같은 이유).
+   정확한 서버 한계는 k6 를 다른 머신에서 돌려야 보인다.
+3. **COMMIT 의 디스크 쓰기 (남은 락 보유 시간의 주범)** — 위에서 본 대로 COMMIT p95 29 ms, 최대 349 ms. 같은 강의의 신청은 한 줄로 서므로 COMMIT 이 느리면 줄 전체가 기다린다.
+   `innodb_flush_log_at_trx_commit = 2` 로 바꾸면 커밋마다 디스크에 쓰지 않아 빨라지지만, MySQL 이 죽으면 최근 1초의 커밋을 잃을 수 있는 트레이드오프가 있다.
+   또는 MySQL 을 가상 디스크가 아닌 환경에서 띄우는 방법이 있다. 다만 이 병목은 신청 요청에만 영향을 주고(신청 p95 3.5 ~ 4.0초), 목록 조회의 느림은 설명하지 못한다.
+4. **남은 락 경합 자체는 작다** — ② 에서 대기 226 ~ 234회. 더 줄이려면 외래 키를 없애 INSERT 를 락 밖으로 빼거나(락 안 문장 3 → 2), 강의별 요청을 큐로 직렬화하는 구조 변경이 필요한데,
+   1 ~ 3번이 해결되기 전에는 체감 효과가 없을 것이다.
+
+### 반영한 코드
+
+- `CourseRepository`: `findByIdForUpdate()` 삭제, `increaseEnrolledCountIfNotFull()` / `decreaseEnrolledCount()` 추가
+- `EnrollmentRepository`: `deleteByIdReturningCount()` 추가
+- `Enrollment`: `(student_id, course_id)` 유니크 제약
+- `EnrollmentService`: `enroll()` 은 ② 방식(1차 검사 → 정원 선검사 → 조건부 UPDATE → INSERT, 유니크 위반은 `EnrollmentException` 으로), `cancel()` 은 DELETE → 조건부 UPDATE
+- `EnrollmentConcurrencyTest`: 같은 학생 10번 동시 신청 테스트 추가

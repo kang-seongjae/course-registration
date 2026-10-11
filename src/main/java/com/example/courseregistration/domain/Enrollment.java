@@ -9,6 +9,7 @@ import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
 
 import java.time.LocalDateTime;
 
@@ -16,11 +17,15 @@ import java.time.LocalDateTime;
  * 수강 신청 엔티티. "어떤 학생이 어떤 강의를 신청했는지"를 기록한다.
  * enrollments 테이블의 한 행에 해당한다.
  *
- * (1단계에서는 일부러 DB 유니크 제약을 걸지 않는다.
- *  중복 신청 검사는 서비스 코드에서만 수행하며, 동시성 문제는 다음 단계에서 다룬다.)
+ * 4단계-2: (student_id, course_id) 유니크 제약을 건다.
+ * 강의 행에 락을 걸지 않게 되면서 "중복 검사 → INSERT" 사이에 다른 요청이 끼어들 수 있으므로,
+ * 같은 학생이 같은 강의를 두 번 신청하는 것은 DB 가 최종적으로 막는다.
  */
 @Entity
-@Table(name = "enrollments")
+@Table(name = "enrollments",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_enrollments_student_course",
+                columnNames = {"student_id", "course_id"}))
 public class Enrollment {
 
     @Id
